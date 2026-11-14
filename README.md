@@ -40,7 +40,7 @@ Widget rendering is scheduled by macOS and may lag behind a record update. The H
 
 ### Uninstall and diagnostics
 
-Download and run `Uninstall-LogitechBatteryBridge.command` from the Release, or right-click the app → **Show Package Contents** → `Contents/Resources/卸载.command`. Administrator authorization is required. Logs and historical configuration backups remain in each user's Library.
+Download and extract `Uninstall-LogitechBatteryBridge.zip` from the Release, then run the enclosed `.command` file, or right-click the app → **Show Package Contents** → `Contents/Resources/卸载.command`. Administrator authorization is required. Logs and historical configuration backups remain in each user's Library.
 
 Logs: `~/Library/Logs/LogitechBatteryBridge/bridge.log`
 
@@ -112,7 +112,7 @@ macOS 14、15、26 尚未实机验证。编译通过、允许安装，不等于�
 
 ### 卸载、日志与构建
 
-在 Release 下载并运行 `Uninstall-LogitechBatteryBridge.command`，或右键应用 → 显示包内容 → `Contents/Resources/卸载.command`。卸载需要管理员授权，用户日志和历史配置备份会保留。
+在 Release 下载并解压 `Uninstall-LogitechBatteryBridge.zip`，再运行里面的 `.command` 文件，或右键应用 → 显示包内容 → `Contents/Resources/卸载.command`。卸载需要管理员授权，用户日志和历史配置备份会保留。
 
 日志位于 `~/Library/Logs/LogitechBatteryBridge/bridge.log`。构建、测试命令见上方英文部分；仅开发者需要 Python 3 和 Xcode 命令行工具，普通安装和运行不需要。
 
