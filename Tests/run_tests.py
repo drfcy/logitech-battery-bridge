@@ -14,5 +14,9 @@ with tempfile.TemporaryDirectory(prefix='battery-bridge-tests-') as temporary:
     main = directory / 'main.swift'
     main.write_text(declarations + '\n' + checks, encoding='utf-8')
     executable = directory / 'checks'
-    subprocess.run(['swiftc', '-framework', 'IOKit', str(root / 'HIDPP.swift'), str(main), '-o', str(executable)], check=True)
+    subprocess.run([
+        'swiftc', '-framework', 'IOKit', '-framework', 'AppKit', '-framework', 'SwiftUI',
+        str(root / 'HIDPP.swift'), str(root / 'Dashboard.swift'), str(root / 'DeviceNames.swift'),
+        str(main), '-o', str(executable)
+    ], check=True)
     subprocess.run([str(executable)], check=True)

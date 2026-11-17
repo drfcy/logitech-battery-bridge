@@ -22,7 +22,7 @@ console_uid=$(/usr/bin/id -u "$console_user")
     done
 '
 /bin/launchctl enable "gui/$console_uid/local.logitech.batterybridge" 2>/dev/null || true
-if ! /bin/launchctl bootstrap "gui/$console_uid" "$agent"; then
+if ! /bin/launchctl asuser "$console_uid" /usr/bin/sudo -H -u "$console_user" /bin/launchctl bootstrap "gui/$console_uid" "$agent"; then
     echo 'Files are installed. Log out and log back in to start the service.' >&2
 fi
 exit 0

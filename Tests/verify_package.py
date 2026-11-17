@@ -19,15 +19,18 @@ with tempfile.TemporaryDirectory(prefix='battery-package-check-') as temporary:
     assert 'minos 14.0' in build, build
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     assert info['LSMinimumSystemVersion'] == '14.0'
-    assert info['CFBundleShortVersionString'] == '1.0.1'
+    assert info['CFBundleShortVersionString'] == '1.3.1'
     agent = plistlib.loads((payload / 'Library/LaunchAgents/local.logitech.batterybridge.plist').read_bytes())
-    assert agent['ProgramArguments'] == ['/Applications/LogitechBatteryBridge.app/Contents/MacOS/LogitechBatteryBridge', '--log-to-file']
-    assert agent['RunAtLoad'] and agent['KeepAlive']
+    assert agent['ProgramArguments'] == ['/Applications/LogitechBatteryBridge.app/Contents/MacOS/LogitechBatteryBridge', '--log-to-file', '--background']
+    assert agent['RunAtLoad'] and agent['KeepAlive']['SuccessfulExit'] is False
     dist = ET.parse(expanded / 'Distribution').getroot()
     assert dist.find('options').get('hostArchitectures') == 'arm64'
     assert dist.find('volume-check/allowed-os-versions/os-version').get('min') == '14.0'
     assert (app / 'Contents/Resources/Source/LICENSE').is_file()
     assert (app / 'Contents/Resources/Source/HIDPP.swift').is_file()
+    assert (app / 'Contents/Resources/Source/Dashboard.swift').is_file()
+    assert (app / 'Contents/Resources/Source/DeviceNames.swift').is_file()
+    assert (app / 'Contents/Resources/AppIcon.icns').is_file()
     assert (app / 'Contents/Resources/卸载.command').stat().st_mode & 0o111
     preinstall = (expanded / 'BridgeComponent.pkg/Scripts/preinstall').read_text()
     assert '"$major_version" -lt 14' in preinstall

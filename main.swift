@@ -2,6 +2,7 @@
 import Foundation
 import IOKit
 import Darwin
+import AppKit
 
 func connectionIsPresent(_ id: UInt64) -> Bool {
     guard id != 0, let matching = IORegistryEntryIDMatching(id) else { return false }
@@ -20,17 +21,21 @@ final class PowerPublisher {
     private let release: Release
     private let lock = NSLock()
     private let isConnected: (UInt64) -> Bool
+    private let names: DeviceNames?
     private var connections: [String: UInt64] = [:]
     private var removedConnections = Set<UInt64>()
     private var sources: [String: UnsafeMutableRawPointer] = [:]
     private var lastSeen: [String: TimeInterval] = [:]
+    private var lastDetails: [String: [String: Any]] = [:]
     // A sleeping device may miss a poll; keep its last reading for at most five minutes.
     private let retention: TimeInterval = 300
 
     init(createFunction: Create? = nil, updateFunction: Update? = nil,
          releaseFunction: Release? = nil,
-         isConnected: @escaping (UInt64) -> Bool = connectionIsPresent) {
+         isConnected: @escaping (UInt64) -> Bool = connectionIsPresent,
+         names: DeviceNames? = nil) {
         self.isConnected = isConnected
+        self.names = names
         guard let lib = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW),
               let c = dlsym(lib, "IOPSCreatePowerSource"),
               let u = dlsym(lib, "IOPSSetPowerSourceDetails"),
@@ -61,7 +66,7 @@ final class PowerPublisher {
                 sources[identifier] = created
             }
             let details: [String: Any] = [
-                "Name": device.name,
+                "Name": names?.displayName(for: device) ?? device.name,
                 "Type": "Accessory Source",
                 "Accessory Category": "Mouse",
                 "Accessory Identifier": identifier,
@@ -78,6 +83,9 @@ final class PowerPublisher {
                 print("Update failed for \(device.name): \(status)")
                 _ = release(source!)
                 sources.removeValue(forKey: identifier)
+                lastDetails.removeValue(forKey: identifier)
+            } else {
+                lastDetails[identifier] = details
             }
         }
         for identifier in Array(sources.keys) where !isConnected(connections[identifier] ?? 0) ||
@@ -85,7 +93,21 @@ final class PowerPublisher {
             _ = release(sources.removeValue(forKey: identifier)!)
             lastSeen.removeValue(forKey: identifier)
             connections.removeValue(forKey: identifier)
+            lastDetails.removeValue(forKey: identifier)
         }
+    }
+
+    // Change only the published name; do not extend the age of a battery reading.
+    func renameDevice(_ id: String, name: String) {
+        lock.lock(); defer { lock.unlock() }
+        let identifier = "local.logitech.direct.batterybridge:" + id
+        guard let source = sources[identifier], var details = lastDetails[identifier],
+              let connection = connections[identifier], !removedConnections.contains(connection),
+              isConnected(connection) else { return }
+        details["Name"] = name
+        let status = update(source, details as CFDictionary)
+        if status == 0 { lastDetails[identifier] = details }
+        else { print("Rename publication failed for \(id): \(status)") }
     }
 
     func removeConnections(_ ids: Set<UInt64>) {
@@ -95,6 +117,7 @@ final class PowerPublisher {
             _ = release(sources.removeValue(forKey: identifier)!)
             lastSeen.removeValue(forKey: identifier)
             connections.removeValue(forKey: identifier)
+            lastDetails.removeValue(forKey: identifier)
             print("Receiver removed; withdrew battery record: \(identifier)")
         }
     }
@@ -105,6 +128,7 @@ final class PowerPublisher {
         sources.removeAll()
         lastSeen.removeAll()
         connections.removeAll()
+        lastDetails.removeAll()
     }
 }
 
@@ -160,8 +184,11 @@ func prepareRuntime() {
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         instanceLock = open(support.appendingPathComponent("bridge.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
         guard instanceLock >= 0 else { fatalError("Cannot open instance lock") }
-        if flock(instanceLock, LOCK_EX | LOCK_NB) != 0 { exit(0) }
-        if CommandLine.arguments.contains("--log-to-file") {
+        if flock(instanceLock, LOCK_EX | LOCK_NB) != 0 {
+            DistributedNotificationCenter.default().postNotificationName(showBridgeWindow, object: nil, userInfo: nil, deliverImmediately: true)
+            exit(0)
+        }
+        if !CommandLine.arguments.contains("--console") {
             let logs = library.appendingPathComponent("Logs/LogitechBatteryBridge", isDirectory: true)
             try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
             let descriptor = open(logs.appendingPathComponent("bridge.log").path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
@@ -176,26 +203,43 @@ func prepareRuntime() {
 setbuf(stdout, nil)
 let once = CommandLine.arguments.contains("--once")
 if !once { prepareRuntime() }
+let application: NSApplication? = once ? nil : NSApplication.shared
+application?.setActivationPolicy(.accessory)
+let deviceNames = DeviceNames()
+let dashboard: DashboardModel? = once ? nil : DashboardModel(names: deviceNames)
 let hid = HIDPP()
 hid.verbose = CommandLine.arguments.contains("--verbose")
-hid.start()
 let worker = DispatchQueue(label: "local.logitech.batterybridge.poll")
-let publisher: PowerPublisher? = once ? nil : PowerPublisher()
+let publisher: PowerPublisher? = once ? nil : PowerPublisher(names: deviceNames)
+let pollTimer = DispatchSource.makeTimerSource(queue: worker)
+pollTimer.setEventHandler { poll() }
+// Coalesce interface notifications from one USB insertion. All HID scanning
+// stays on worker; the HID manager's notification queue never opens devices.
+if !once {
+    hid.onDevicesChanged = {
+        worker.async {
+            print("\(ISO8601DateFormatter().string(from: Date())) Receiver topology changed; refreshing connection")
+            pollTimer.schedule(deadline: .now() + .milliseconds(300))
+        }
+    }
+}
 let removalMonitor: ReceiverRemovalMonitor? = once ? nil : ReceiverRemovalMonitor { ids in
     publisher?.removeConnections(ids)
+    dashboard?.removeConnections(ids)
 }
 var signalSources: [DispatchSourceSignal] = []
 for number in [SIGTERM, SIGINT] {
     signal(number, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
     source.setEventHandler {
-        worker.async { publisher?.close(); exit(0) }
+        worker.async { pollTimer.cancel(); hid.close(); publisher?.close(); exit(0) }
     }
     source.resume()
     signalSources.append(source)
 }
 
 func poll() {
+    if !once { DispatchQueue.main.async { dashboard?.beginRefresh() } }
     hid.rescan()
     var readings = hid.scanAll()
     if readings.isEmpty && !once {
@@ -208,9 +252,33 @@ func poll() {
         print("\(ISO8601DateFormatter().string(from: Date())) \(device.name): \(device.percent ?? -1)% \(device.state) id=\(device.id)")
     }
     if readings.isEmpty { print("No supported mouse answered; keeping last valid readings for up to five minutes") }
-    if once { exit(readings.isEmpty ? 1 : 0) }
+    if once { hid.close(); exit(readings.isEmpty ? 1 : 0) }
     publisher?.publish(readings)
-    worker.asyncAfter(deadline: .now() + 60) { poll() }
+    let completedReadings = readings
+    let count = hid.deviceCount
+    DispatchQueue.main.async { dashboard?.finishRefresh(completedReadings, receiverCount: count) }
+    pollTimer.schedule(deadline: .now() + 60)
 }
-worker.async { poll() }
-dispatchMain()
+let dashboardController: DashboardController? = dashboard.map { model in
+    DashboardController(model: model,
+        background: CommandLine.arguments.contains("--background"),
+        refresh: {
+            model.beginRefresh()
+            worker.async { pollTimer.schedule(deadline: .now()) }
+        }, rename: { id, text in
+            let name = try model.renameDevice(id, name: text)
+            worker.async { publisher?.renameDevice(id, name: name) }
+        }, quit: {
+            worker.async {
+                pollTimer.cancel()
+                hid.close()
+                publisher?.close()
+                DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
+            }
+        })
+}
+application?.delegate = dashboardController
+hid.start()
+pollTimer.schedule(deadline: .now())
+pollTimer.resume()
+if let application { application.run() } else { dispatchMain() }

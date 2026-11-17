@@ -1,5 +1,5 @@
 // Adapted from APKiwi/Squeak HIDPPKit, GPL-3.0.
-// Modified 2026-11-14: mouse filtering, six receiver slots, independent software tag, zero-percent support.
+// Modified 2026-11-14 and 2026-11-17: filtering, transaction tags, hotplug recovery.
 import Foundation
 import IOKit
 import IOKit.hid
@@ -83,7 +83,15 @@ public final class HIDPP: @unchecked Sendable {
     private var pids: [Int] = []                 // parallel to devices
     private var targetDevice: IOHIDDevice?       // when set, requests go only here
     private let queue = DispatchQueue(label: "kiwi.ap.g502.hidpp")
-    private let inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+    private let topologyQueue = DispatchQueue(label: "local.logitech.batterybridge.devices")
+    // Set before start(). Called on topologyQueue; callers must dispatch scan work
+    // to their polling queue, never mutate the device list in this callback.
+    public var onDevicesChanged: (() -> Void)?
+
+    private final class CallbackContext {
+        weak var owner: HIDPP?
+        init(_ owner: HIDPP) { self.owner = owner }
+    }
 
     // request/response synchronisation
     private let lock = NSLock()
@@ -101,7 +109,7 @@ public final class HIDPP: @unchecked Sendable {
 
     public init() {}
 
-    deinit { inputBuffer.deallocate() }
+    deinit { close() }
 
     // MARK: - Setup
 
@@ -110,17 +118,33 @@ public final class HIDPP: @unchecked Sendable {
         rescan()
     }
 
-    /// Creates the HID manager and installs the Vendor 0x046D / usage-page 0xFF00 filter.
-    /// Doesn't enumerate — that's `rescan()`. Split out so we can re-scan later without
-    /// recreating the manager.
+    /// Monitor current and future matching receivers. Device setup remains on
+    /// the caller's serial polling queue, separate from topology notifications.
     public func armManager() {
-        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        precondition(manager == nil)
+        // IndependentDevices prevents manager activation from also activating each
+        // device before its report callback and private dispatch queue are installed.
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOHIDManagerOptions.independentDevices.rawValue)
         let match: [String: Any] = [
             kIOHIDVendorIDKey as String: kVendorLogitech,
             kIOHIDDeviceUsagePageKey as String: kUsagePageHIDPP,
         ]
         IOHIDManagerSetDeviceMatching(mgr, match as CFDictionary)
+        let context = Unmanaged.passRetained(CallbackContext(self)).toOpaque()
+        let changed: IOHIDDeviceCallback = { context, _, _, _ in
+            guard let context else { return }
+            Unmanaged<CallbackContext>.fromOpaque(context).takeUnretainedValue().owner?.onDevicesChanged?()
+        }
+        IOHIDManagerRegisterDeviceMatchingCallback(mgr, changed, context)
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, changed, context)
+        IOHIDManagerSetDispatchQueue(mgr, topologyQueue)
+        let retainedManager = Unmanaged.passRetained(mgr).toOpaque()
+        IOHIDManagerSetCancelHandler(mgr) {
+            Unmanaged<CallbackContext>.fromOpaque(context).release()
+            Unmanaged<IOHIDManager>.fromOpaque(retainedManager).release()
+        }
         self.manager = mgr
+        IOHIDManagerActivate(mgr)
     }
 
     /// (Re-)enumerates matching devices and sets up any we aren't already tracking.
@@ -128,41 +152,75 @@ public final class HIDPP: @unchecked Sendable {
     /// enumerates *after* launch — notably when started as a login item before the USB
     /// HID stack is up, which a one-shot scan at startup would miss permanently.
     ///
-    /// We enumerate synchronously rather than via the manager's dispatch applier:
-    /// registering a per-device input callback inside the manager applier traps in IOKit.
+    /// The activated independent manager keeps its snapshot current. Reconcile
+    /// both removals and arrivals on every call, including an empty snapshot.
     public func rescan() {
         guard let mgr = manager else { return }
-        guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
-            log("rescan: no Logitech HID++ devices found yet")
-            return
+        #if HOTPLUG_TESTING
+        let set = deviceSnapshotForTesting?() ?? ((IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>) ?? [])
+        #else
+        let set = (IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>) ?? []
+        #endif
+        let freshIDs = Set(set.map { connectionID(of: $0) })
+        var kept: [IOHIDDevice] = []
+        var keptPids: [Int] = []
+        for (i, dev) in devices.enumerated() {
+            let id = connectionID(of: dev)
+            if freshIDs.contains(id), connectionIsAlive(id) {
+                kept.append(dev)
+                keptPids.append(pids[i])
+            } else {
+                log("rescan: dropping disconnected connection \(id)")
+                IOHIDDeviceCancel(dev)
+            }
         }
+        devices = kept
+        pids = keptPids
+        var trackedIDs = Set(devices.map { connectionID(of: $0) })
         var added = 0
-        for dev in set where !devices.contains(dev) { setUpDevice(dev); added += 1 }
+        for dev in set {
+            let id = connectionID(of: dev)
+            guard !trackedIDs.contains(id), connectionIsAlive(id) else { continue }
+            setUpDevice(dev)
+            trackedIDs.insert(id)
+            added += 1
+        }
         log(added > 0 ? "rescan: now tracking \(devices.count) HID++ device(s)"
                       : "rescan: already tracking \(devices.count) HID++ device(s)")
     }
 
+    #if HOTPLUG_TESTING
+    // Integration harness can simulate an empty/mixed snapshot while using real
+    // receiver handles. Not present in the shipped binary.
+    var deviceSnapshotForTesting: (() -> Set<IOHIDDevice>)?
+    #endif
+
     public var deviceCount: Int { devices.count }
 
-    /// Probe/test seam. Reproduces the post-sleep/wake state where our captured device
-    /// refs have gone stale: appends a real but un-opened HID device that is NOT part of
-    /// the Vendor 0x046D / FF00 match, so `devices` is non-empty yet every SetReport on it
-    /// fails, and a fresh `IOHIDManagerCopyDevices()` won't contain it (mirrors a ref that
-    /// USB re-enumeration replaced with a new-identity object). Returns false if the machine
-    /// has no spare HID device to borrow. Not used by the app.
-    public func injectStaleDeviceForTesting() -> Bool {
-        let probe = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        IOHIDManagerSetDeviceMatching(probe, nil)  // match everything
-        guard let all = IOHIDManagerCopyDevices(probe) as? Set<IOHIDDevice> else { return false }
-        let ours = (manager.flatMap { IOHIDManagerCopyDevices($0) as? Set<IOHIDDevice> }) ?? []
-        // Borrow a device the HID++ matcher doesn't claim, and never open it: SetReport will
-        // return kIOReturnNotOpen, exactly the all-sends-fail signature of stale refs.
-        guard let victim = all.first(where: { !ours.contains($0) }) else { return false }
-        let pid = IOHIDDeviceGetProperty(victim, kIOHIDProductIDKey as CFString) as? Int ?? 0
-        devices.append(victim)
-        pids.append(pid)
-        log(String(format: "injected stale device pid=0x%04X, deviceCount=%d", pid, devices.count))
+    public var connectionIDs: Set<UInt64> { Set(devices.map { connectionID(of: $0) }) }
+
+    private func connectionID(of dev: IOHIDDevice) -> UInt64 {
+        var id: UInt64 = 0
+        IORegistryEntryGetRegistryEntryID(IOHIDDeviceGetService(dev), &id)
+        return id
+    }
+
+    private func connectionIsAlive(_ id: UInt64) -> Bool {
+        guard id != 0, let matching = IORegistryEntryIDMatching(id) else { return false }
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard service != 0 else { return false }
+        IOObjectRelease(service)
         return true
+    }
+
+    // Call on the same serial queue as rescan/scanAll.
+    public func close() {
+        if let manager { IOHIDManagerCancel(manager) }
+        manager = nil
+        for dev in devices { IOHIDDeviceCancel(dev) }
+        devices.removeAll()
+        pids.removeAll()
+        targetDevice = nil
     }
 
     private func setUpDevice(_ dev: IOHIDDevice) {
@@ -177,16 +235,24 @@ public final class HIDPP: @unchecked Sendable {
         }
 
         // Canonical per-device order: register callback, give the device its own
-        // dispatch queue, then activate. (Not the manager — the manager stays passive.)
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        // dispatch queue, then activate. The independent manager only tracks topology.
+        let inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+        let ctx = Unmanaged.passRetained(CallbackContext(self)).toOpaque()
         IOHIDDeviceRegisterInputReportCallback(dev, inputBuffer, 64, { context, _, _, _, _, report, length in
             guard let context else { return }
-            let me = Unmanaged<HIDPP>.fromOpaque(context).takeUnretainedValue()
+            guard let me = Unmanaged<CallbackContext>.fromOpaque(context).takeUnretainedValue().owner else { return }
             // The report buffer already includes the report ID as byte 0.
             let bytes = Array(UnsafeBufferPointer(start: report, count: length))
             me.handleInput(bytes)
         }, ctx)
         IOHIDDeviceSetDispatchQueue(dev, queue)
+        let retainedDevice = Unmanaged.passRetained(dev).toOpaque()
+        IOHIDDeviceSetCancelHandler(dev) {
+            let device = Unmanaged<IOHIDDevice>.fromOpaque(retainedDevice).takeRetainedValue()
+            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            inputBuffer.deallocate()
+            Unmanaged<CallbackContext>.fromOpaque(ctx).release()
+        }
         IOHIDDeviceActivate(dev)
 
         devices.append(dev)
@@ -253,6 +319,7 @@ public final class HIDPP: @unchecked Sendable {
             var anySent = false
             let targets = targetDevice.map { [$0] } ?? devices
             for dev in targets {
+                guard connectionIsAlive(connectionID(of: dev)) else { continue }
                 let r = frame.withUnsafeBufferPointer {
                     IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(reportID), $0.baseAddress!, len)
                 }
@@ -346,25 +413,9 @@ public final class HIDPP: @unchecked Sendable {
     /// the empty-list rescan can't help (because `devices` was never empty). Returns true if
     /// the tracked set changed.
     private func reconcileStaleDevices() -> Bool {
-        guard let mgr = manager else { return false }
-        let fresh = (IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>) ?? []
-        var kept: [IOHIDDevice] = []
-        var keptPids: [Int] = []
-        var changed = false
-        for (i, dev) in devices.enumerated() {
-            if fresh.contains(dev) {
-                kept.append(dev)
-                keptPids.append(pids[i])
-            } else {
-                IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-                changed = true
-            }
-        }
-        devices = kept
-        pids = keptPids
-        for dev in fresh where !devices.contains(dev) { setUpDevice(dev); changed = true }
-        log("reconcile: now tracking \(devices.count) HID++ device(s) after dropping stale refs")
-        return changed
+        let previous = connectionIDs
+        rescan()
+        return connectionIDs != previous
     }
 
     // DEVICE_NAME 0x0005: func 0x00 getCount -> [0]=length; func 0x01 getName(charIndex) ->
